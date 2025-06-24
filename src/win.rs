@@ -24,20 +24,21 @@ static TASK_MANAGER_OVERRIDE_ENABLED_VALUE: [u8; 12] = [
 fn is_msix() -> bool {
     unsafe {
         let mut length: u32 = 0;
-        let result = GetCurrentPackageFullName(&mut length, PWSTR::null());
+        let code = GetCurrentPackageFullName(&mut length, None);
 
-        if result == APPMODEL_ERROR_NO_PACKAGE {
+        if code == APPMODEL_ERROR_NO_PACKAGE {
             return false;
         }
 
-        if result != ERROR_INSUFFICIENT_BUFFER {
+        if code != ERROR_INSUFFICIENT_BUFFER {
             return false;
         }
 
         let mut buffer = vec![0u16; length as usize];
-        let result = GetCurrentPackageFullName(&mut length, PWSTR::from_raw(buffer.as_mut_ptr()));
+        let code =
+            GetCurrentPackageFullName(&mut length, Some(PWSTR::from_raw(buffer.as_mut_ptr())));
 
-        result == ERROR_SUCCESS
+        code == ERROR_SUCCESS
     }
 }
 
