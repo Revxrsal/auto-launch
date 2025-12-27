@@ -1,4 +1,4 @@
-use crate::{AutoLaunch, Result};
+use crate::{AutoLaunch, Result, WindowsEnableMode};
 use ::windows::ApplicationModel::StartupTask;
 use windows::Win32::Foundation::{
     APPMODEL_ERROR_NO_PACKAGE, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS,
@@ -61,12 +61,12 @@ impl AutoLaunch {
     /// ## Notes
     ///
     /// The parameters of `AutoLaunch::new` are different on each platform.
-    pub fn new(app_name: &str, app_path: &str, args: &[impl AsRef<str>]) -> AutoLaunch {
+    pub fn new(app_name: &str, app_path: &str, args: &[impl AsRef<str>], enable_mode: WindowsEnableMode) -> AutoLaunch {
         AutoLaunch {
             app_name: app_name.into(),
             app_path: app_path.into(),
             args: args.iter().map(|s| s.as_ref().to_string()).collect(),
-            enable_mode: Default::default(),
+            enable_mode,
         }
     }
 

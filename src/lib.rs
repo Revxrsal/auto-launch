@@ -16,7 +16,7 @@
 //!     let app_name = "the-app";
 //!     let app_path = "/path/to/the-app";
 //!     let args = &["--minimized"];
-//!     let auto = AutoLaunch::new(app_name, app_path, args);
+//!     let auto = AutoLaunch::new(app_name, app_path, args,);
 //!
 //!     // enable the auto launch
 //!     auto.enable().is_ok();
@@ -160,7 +160,7 @@ mod windows;
 /// # let app_name = "the-app";
 /// # let app_path = "/path/to/the-app";
 /// # let args = &["--minimized"];
-/// AutoLaunch::new(app_name, app_path, args);
+/// AutoLaunch::new(app_name, app_path, args,);
 /// # }
 /// ```
 ///
@@ -385,7 +385,7 @@ impl AutoLaunchBuilder {
         let args = self.args.clone().unwrap_or_default();
         let bundle_identifiers = self.bundle_identifiers.clone().unwrap_or_default();
         let agent_extra_config = self.agent_extra_config.as_ref().map_or("", |v| v);
-
+        let windows_enable_mode = self.windows_enable_mode;
         #[cfg(target_os = "linux")]
         return Ok(AutoLaunch::new(app_name, app_path, &args));
         #[cfg(target_os = "macos")]
@@ -398,7 +398,12 @@ impl AutoLaunchBuilder {
             agent_extra_config,
         ));
         #[cfg(target_os = "windows")]
-        return Ok(AutoLaunch::new(app_name, app_path, &args));
+        return Ok(AutoLaunch::new(
+            app_name,
+            app_path,
+            &args,
+            windows_enable_mode,
+        ));
 
         #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         return Err(Error::UnsupportedOS);
