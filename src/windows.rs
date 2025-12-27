@@ -1,39 +1,72 @@
-use crate::{AutoLaunch, Result, WindowsEnableMode};
-use std::io;
-use windows_registry::{Key, CURRENT_USER, LOCAL_MACHINE};
-use windows_result::HRESULT;
+use crate::{AutoLaunch, Result};
+use ::windows::ApplicationModel::StartupTask;
+use windows::Win32::Foundation::{
+    APPMODEL_ERROR_NO_PACKAGE, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS,
+};
+use windows::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
+use windows_core::PWSTR;
+use winreg::enums::RegType::REG_BINARY;
+use winreg::enums::{
+    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, KEY_READ, KEY_SET_VALUE,
+};
+use winreg::{RegKey, RegValue};
 
-const AL_REGKEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
-const TASK_MANAGER_OVERRIDE_REGKEY: &str =
-    r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
-const TASK_MANAGER_OVERRIDE_ENABLED_VALUE: [u8; 12] = [
+static ADMIN_AL_REGKEY: &str = "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run";
+static AL_REGKEY: &str = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
+static ADMIN_TASK_MANAGER_OVERRIDE_REGKEY: &str =
+    "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run32";
+static TASK_MANAGER_OVERRIDE_REGKEY: &str =
+    "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
+static TASK_MANAGER_OVERRIDE_ENABLED_VALUE: [u8; 12] = [
     0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
-const E_ACCESSDENIED: HRESULT = HRESULT::from_win32(0x80070005_u32);
-const E_FILENOTFOUND: HRESULT = HRESULT::from_win32(0x80070002_u32);
+
+fn is_msix() -> bool {
+    unsafe {
+        let mut length: u32 = 0;
+        let code = GetCurrentPackageFullName(&mut length, None);
+
+        if code == APPMODEL_ERROR_NO_PACKAGE {
+            return false;
+        }
+
+        if code != ERROR_INSUFFICIENT_BUFFER {
+            return false;
+        }
+
+        let mut buffer = vec![0u16; length as usize];
+        let code =
+            GetCurrentPackageFullName(&mut length, Some(PWSTR::from_raw(buffer.as_mut_ptr())));
+
+        code == ERROR_SUCCESS
+    }
+}
+
+fn get_startup_task() -> windows_core::Result<StartupTask> {
+    let task_list = StartupTask::GetForCurrentPackageAsync()?.get()?;
+    if task_list.Size()? > 0 {
+        let task = task_list.GetAt(0)?;
+        return Ok(task);
+    }
+    Err(windows_core::Error::empty())
+}
 
 /// Windows implement
 impl AutoLaunch {
     /// Create a new AutoLaunch instance
     /// - `app_name`: application name
     /// - `app_path`: application path
-    /// - `enable_mode`: behavior of the enable feature
     /// - `args`: startup args passed to the binary
     ///
     /// ## Notes
     ///
     /// The parameters of `AutoLaunch::new` are different on each platform.
-    pub fn new(
-        app_name: &str,
-        app_path: &str,
-        enable_mode: WindowsEnableMode,
-        args: &[impl AsRef<str>],
-    ) -> AutoLaunch {
+    pub fn new(app_name: &str, app_path: &str, args: &[impl AsRef<str>]) -> AutoLaunch {
         AutoLaunch {
             app_name: app_name.into(),
             app_path: app_path.into(),
-            enable_mode,
             args: args.iter().map(|s| s.as_ref().to_string()).collect(),
+            enable_mode: Default::default(),
         }
     }
 
@@ -44,57 +77,52 @@ impl AutoLaunch {
     /// - failed to open the registry key
     /// - failed to set value
     pub fn enable(&self) -> Result<()> {
-        match self.enable_mode {
-            WindowsEnableMode::Dynamic => self
-                .enable_as_admin()
-                .or_else(|e| {
-                    if e.code() == E_ACCESSDENIED {
-                        self.enable_as_current_user()
-                    } else {
-                        Err(e)
-                    }
-                })
-                .map_err(std::io::Error::from)?,
-            WindowsEnableMode::CurrentUser => self
-                .enable_as_current_user()
-                .map_err(std::io::Error::from)?,
-            WindowsEnableMode::System => self.enable_as_admin().map_err(std::io::Error::from)?,
-        }
-        Ok(())
-    }
-
-    fn enable_as_admin(&self) -> windows_registry::Result<()> {
-        self.enable_with_root_key(LOCAL_MACHINE)
-    }
-
-    fn enable_as_current_user(&self) -> windows_registry::Result<()> {
-        self.enable_with_root_key(CURRENT_USER)
-    }
-
-    fn enable_with_root_key(&self, root_key: &Key) -> windows_registry::Result<()> {
-        root_key.create(AL_REGKEY)?.set_string(
-            &self.app_name,
-            format!("{} {}", &self.app_path, &self.args.join(" ")),
-        )?;
-
-        match root_key
-            .options()
-            .write()
-            .open(TASK_MANAGER_OVERRIDE_REGKEY)
-        {
-            Ok(key) => key.set_bytes(
-                &self.app_name,
-                windows_registry::Type::Bytes,
-                &TASK_MANAGER_OVERRIDE_ENABLED_VALUE,
-            )?,
-            Err(error) if error.code() == E_FILENOTFOUND => {
-                return Ok(());
+        if is_msix() {
+            let task = get_startup_task()?;
+            task.RequestEnableAsync()?.get()?;
+            Ok(())
+        } else {
+            let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+            let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+            if let Ok(reg) = hklm.open_subkey_with_flags(ADMIN_AL_REGKEY, KEY_SET_VALUE) {
+                reg.set_value::<_, _>(
+                    &self.app_name,
+                    &format!("{} {}", &self.app_path, &self.args.join(" ")),
+                )?;
+                // this key maybe not found
+                if let Ok(reg) =
+                    hklm.open_subkey_with_flags(ADMIN_TASK_MANAGER_OVERRIDE_REGKEY, KEY_SET_VALUE)
+                {
+                    reg.set_raw_value(
+                        &self.app_name,
+                        &RegValue {
+                            vtype: REG_BINARY,
+                            bytes: TASK_MANAGER_OVERRIDE_ENABLED_VALUE.to_vec(),
+                        },
+                    )?;
+                }
+            } else {
+                hkcu.open_subkey_with_flags(AL_REGKEY, KEY_SET_VALUE)?
+                    .set_value::<_, _>(
+                        &self.app_name,
+                        &format!("{} {}", &self.app_path, &self.args.join(" ")),
+                    )?;
+                // this key maybe not found
+                if let Ok(reg) =
+                    hkcu.open_subkey_with_flags(TASK_MANAGER_OVERRIDE_REGKEY, KEY_SET_VALUE)
+                {
+                    reg.set_raw_value(
+                        &self.app_name,
+                        &RegValue {
+                            vtype: REG_BINARY,
+                            bytes: TASK_MANAGER_OVERRIDE_ENABLED_VALUE.to_vec(),
+                        },
+                    )?;
+                }
             }
-            Err(error) => {
-                return Err(error);
-            }
+
+            Ok(())
         }
-        Ok(())
     }
 
     /// Disable the AutoLaunch setting
@@ -104,90 +132,65 @@ impl AutoLaunch {
     /// - failed to open the registry key
     /// - failed to delete value
     pub fn disable(&self) -> Result<()> {
-        // try to delete both admin and current user registry values
-        if let Err(error) = self.disable_as_admin() {
-            if error.code() == E_ACCESSDENIED {
-                match self.enable_mode {
-                    // Fail if our enable mode is system but we don't have the access
-                    WindowsEnableMode::System => return Err(std::io::Error::from(error).into()),
-                    // Otherwise ignore this error
-                    _ => {}
-                }
+        if is_msix() {
+            let task = get_startup_task()?;
+            task.Disable()?;
+            Ok(())
+        } else {
+            let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+            let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+
+            if let Ok(reg) = hklm.open_subkey_with_flags(ADMIN_AL_REGKEY, KEY_SET_VALUE) {
+                reg.delete_value(&self.app_name)?;
             } else {
-                return Err(std::io::Error::from(error).into());
+                hkcu.open_subkey_with_flags(AL_REGKEY, KEY_SET_VALUE)?
+                    .delete_value(&self.app_name)?;
             }
-        }
-        self.disable_as_current_user()
-            .map_err(std::io::Error::from)?;
-        Ok(())
-    }
-
-    fn disable_as_admin(&self) -> windows_registry::Result<()> {
-        self.disable_with_root_key(LOCAL_MACHINE)
-    }
-
-    fn disable_as_current_user(&self) -> windows_registry::Result<()> {
-        self.disable_with_root_key(CURRENT_USER)
-    }
-
-    fn disable_with_root_key(&self, root_key: &Key) -> windows_registry::Result<()> {
-        match root_key
-            .options()
-            .write()
-            .open(AL_REGKEY)
-            .and_then(|key| key.remove_value(&self.app_name))
-        {
-            Ok(_) => Ok(()),
-            Err(error) if error.code() == E_FILENOTFOUND => Ok(()),
-            Err(error) => Err(error),
+            Ok(())
         }
     }
 
     /// Check whether the AutoLaunch setting is enabled
     pub fn is_enabled(&self) -> Result<bool> {
-        let is_registered =
-            self.is_registered(LOCAL_MACHINE)? || self.is_registered(CURRENT_USER)?;
-        if !is_registered {
-            return Ok(false);
+        if is_msix() {
+            let task = get_startup_task()?;
+            Ok(task.State()? == windows::ApplicationModel::StartupTaskState::Enabled)
+        } else {
+            let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+            let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+            // check if the app is enabled in the admin registry
+            // use `KEY_ALL_ACCESS` to ensure have admin permission
+            if let Ok(reg) = hklm.open_subkey_with_flags(ADMIN_AL_REGKEY, KEY_ALL_ACCESS) {
+                let adm_enabled = reg.get_value::<String, _>(&self.app_name).is_ok();
+                let task_manager_enabled =
+                    self.task_manager_enabled(hklm, ADMIN_TASK_MANAGER_OVERRIDE_REGKEY);
+                Ok(adm_enabled && task_manager_enabled.unwrap_or(true))
+            } else {
+                let al_enabled = hkcu
+                    .open_subkey_with_flags(AL_REGKEY, KEY_READ)?
+                    .get_value::<String, _>(&self.app_name)
+                    .is_ok();
+                let task_manager_enabled =
+                    self.task_manager_enabled(hkcu, TASK_MANAGER_OVERRIDE_REGKEY);
+
+                Ok(al_enabled && task_manager_enabled.unwrap_or(true))
+            }
         }
-        let is_task_manager_enabled = self.is_task_manager_enabled(LOCAL_MACHINE)?
-            && self.is_task_manager_enabled(CURRENT_USER)?;
-        Ok(is_task_manager_enabled)
     }
 
-    fn is_registered(&self, root_key: &Key) -> io::Result<bool> {
-        let registered = match root_key
-            .open(AL_REGKEY)
-            .and_then(|key| key.get_string(&self.app_name))
-        {
-            Ok(_) => true,
-            Err(error) if error.code() == E_FILENOTFOUND => false,
-            Err(error) => {
-                return Err(error.into());
-            }
-        };
-        Ok(registered)
-    }
-
-    fn is_task_manager_enabled(&self, root_key: &Key) -> io::Result<bool> {
-        let task_manager_enabled = match root_key
-            .open(TASK_MANAGER_OVERRIDE_REGKEY)
-            .and_then(|key| key.get_value(&self.app_name))
-        {
-            Ok(value) => last_eight_bytes_all_zeros(&value).unwrap_or(true),
-            Err(error) if error.code() == E_FILENOTFOUND => true,
-            Err(error) => {
-                return Err(error.into());
-            }
-        };
-        Ok(task_manager_enabled)
+    fn task_manager_enabled(&self, hk: RegKey, path: &str) -> Option<bool> {
+        let task_manager_override_raw_value = hk
+            .open_subkey_with_flags(path, KEY_READ)
+            .ok()?
+            .get_raw_value(&self.app_name)
+            .ok()?;
+        last_eight_bytes_all_zeros(&task_manager_override_raw_value.bytes)
     }
 }
 
-fn last_eight_bytes_all_zeros(bytes: &[u8]) -> std::result::Result<bool, &str> {
+fn last_eight_bytes_all_zeros(bytes: &[u8]) -> Option<bool> {
     if bytes.len() < 8 {
-        Err("Bytes too short")
-    } else {
-        Ok(bytes.iter().rev().take(8).all(|v| *v == 0u8))
+        return None;
     }
+    Some(bytes.iter().rev().take(8).all(|v| *v == 0u8))
 }

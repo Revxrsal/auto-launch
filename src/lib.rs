@@ -131,6 +131,9 @@ pub enum Error {
     AppPathIsNotAbsolute(std::path::PathBuf),
     #[error("Failed to execute apple script with status: {0}")]
     AppleScriptFailed(i32),
+    #[cfg(target_os = "windows")]
+    #[error("Windows: {0}")]
+    Windows(#[from] windows_core::Error),
     #[error("Unsupported target os")]
     UnsupportedOS,
     #[error(transparent)]
@@ -395,12 +398,7 @@ impl AutoLaunchBuilder {
             agent_extra_config,
         ));
         #[cfg(target_os = "windows")]
-        return Ok(AutoLaunch::new(
-            app_name,
-            app_path,
-            self.windows_enable_mode,
-            &args,
-        ));
+        return Ok(AutoLaunch::new(app_name, app_path, &args));
 
         #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         return Err(Error::UnsupportedOS);
